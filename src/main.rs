@@ -20,7 +20,7 @@ use std::{
     fs::create_dir_all,
     panic,
     path::Path,
-    process::{exit, Command},
+    process::exit,
     str::FromStr,
     thread,
 };
@@ -49,7 +49,7 @@ struct Opt {
     version: bool,
 }
 
-fn main() {
+async fn async_main() -> Result<(), Error> {
     parse_args();
     launch_info();
 
@@ -62,12 +62,15 @@ fn main() {
         _ => false,
     };
 
-    check_rsa_keys();
+    check_rsa_keys().unwrap_or_else(|_| {
+        error!("Error creating keys, exiting...");
+        exit(1);
+    });
     check_web_vault();
 
     create_icon_cache_folder();
 
-    launch_rocket(extra_debug);
+    launch_rocket(extra_debug).await
 }
 
 fn parse_args() {
@@ -204,52 +207,29 @@ fn create_icon_cache_folder() {
     create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache directory");
 }
 
-fn check_rsa_keys() {
+fn check_rsa_keys() -> Result<(), crate::error::Error> {
     // If the RSA keys don't exist, try to create them
-    if !util::file_exists(&CONFIG.private_rsa_key()) || !util::file_exists(&CONFIG.public_rsa_key()) {
-        info!("JWT keys don't exist, checking if OpenSSL is available...");
+    let priv_path = CONFIG.private_rsa_key();
+    let pub_path = CONFIG.public_rsa_key();
 
-        Command::new("openssl").arg("version").status().unwrap_or_else(|_| {
-            info!(
-                "Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH"
-            );
-            exit(1);
-        });
+    if !util::file_exists(&priv_path) {
+        let rsa_key = openssl::rsa::Rsa::generate(2048)?;
 
-        info!("OpenSSL detected, creating keys...");
-
-        let key = CONFIG.rsa_key_filename();
-
-        let pem = format!("{}.pem", key);
-        let priv_der = format!("{}.der", key);
-        let pub_der = format!("{}.pub.der", key);
-
-        let mut success = Command::new("openssl")
-            .args(&["genrsa", "-out", &pem])
-            .status()
-            .expect("Failed to create private pem file")
-            .success();
-
-        success &= Command::new("openssl")
-            .args(&["rsa", "-in", &pem, "-outform", "DER", "-out", &priv_der])
-            .status()
-            .expect("Failed to create private der file")
-            .success();
-
-        success &= Command::new("openssl")
-            .args(&["rsa", "-in", &priv_der, "-inform", "DER"])
-            .args(&["-RSAPublicKey_out", "-outform", "DER", "-out", &pub_der])
-            .status()
-            .expect("Failed to create public der file")
-            .success();
-
-        if success {
-            info!("Keys created correctly.");
-        } else {
-            error!("Error creating keys, exiting...");
-            exit(1);
-        }
+        let priv_key = rsa_key.private_key_to_pem()?;
+        crate::util::write_file(&priv_path, &priv_key)?;
+        info!("Private key created correctly.");
     }
+
+    if !util::file_exists(&pub_path) {
+        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&util::read_file(&priv_path)?)?;
+
+        let pub_key = rsa_key.public_key_to_pem()?;
+        crate::util::write_file(&pub_path, &pub_key)?;
+        info!("Public key created correctly.");
+    }
+
+    auth::load_keys();
+    Ok(())
 }
 
 fn check_web_vault() {
@@ -267,7 +247,7 @@ fn check_web_vault() {
     }
 }
 
-fn launch_rocket(extra_debug: bool) {
+async fn launch_rocket(extra_debug: bool) -> Result<(), Error> {
     let pool = match db::DbPool::from_config() {
         Ok(p) => p,
         Err(e) => {
@@ -280,7 +260,7 @@ fn launch_rocket(extra_debug: bool) {
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let result = rocket::ignite()
+    let mut instance = rocket::ignite()
         .mount(&[basepath, "/"].concat(), api::web_routes())
         .mount(&[basepath, "/api"].concat(), api::core_routes())
         .mount(&[basepath, "/admin"].concat(), api::admin_routes())
@@ -291,10 +271,25 @@ fn launch_rocket(extra_debug: bool) {
         .manage(api::start_notification_server())
         .attach(util::AppHeaders())
         .attach(util::CORS())
-        .attach(util::BetterLogging(extra_debug))
-        .launch();
+        .attach(util::BetterLogging(extra_debug));
 
-    // Launch and print error if there is one
-    // The launch will restore the original logging level
-    error!("Launch error {:#?}", result);
+    CONFIG.set_rocket_shutdown_handle(instance.inspect().await.shutdown());
+    ctrlc::set_handler(move || {
+        info!("Exiting bitwarden_rs!");
+        CONFIG.shutdown();
+    })
+    .expect("Error setting Ctrl-C handler");
+    
+    instance.launch().await?;
+    
+    info!("Bitwarden_rs process exited!");
+    Ok(())
+}
+
+fn main() -> Result<(), Error> {
+    tokio::runtime::Builder::new()
+        .threaded_scheduler()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
 }

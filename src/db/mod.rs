@@ -37,6 +37,7 @@ macro_rules! generate_connections {
         pub enum DbConn { $( #[cfg($name)] $name(PooledConnection<ConnectionManager< $ty >>), )+ }
 
         #[allow(non_camel_case_types)]
+        #[derive(Clone)]
         pub enum DbPool { $( #[cfg($name)] $name(Pool<ConnectionManager< $ty >>), )+ }
 
         impl DbPool {
@@ -220,16 +221,20 @@ pub fn backup_database() -> Result<(), Error> {
 /// Attempts to retrieve a single connection from the managed database pool. If
 /// no pool is currently managed, fails with an `InternalServerError` status. If
 /// no connections are available, fails with a `ServiceUnavailable` status.
+#[rocket::async_trait]
 impl<'a, 'r> FromRequest<'a, 'r> for DbConn {
     type Error = ();
 
-    fn from_request(request: &'a Request<'r>) -> Outcome<DbConn, ()> {
-        // https://github.com/SergioBenitez/Rocket/commit/e3c1a4ad3ab9b840482ec6de4200d30df43e357c
-        let pool = try_outcome!(request.guard::<State<DbPool>>());
-        match pool.get() {
+    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        let pool: DbPool = try_outcome!(request.guard::<State<DbPool>>().await).clone();
+
+        // TODO: We are basically doing the same as rocket's #[database(name)] macro, maybe we should just use that?
+        tokio::task::spawn_blocking(move || match pool.get() {
             Ok(conn) => Outcome::Success(conn),
             Err(_) => Outcome::Failure((Status::ServiceUnavailable, ())),
-        }
+        })
+        .await
+        .expect("failed to spawn a blocking task to get a pooled connection")
     }
 }
 

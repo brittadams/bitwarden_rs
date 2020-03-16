@@ -1,15 +1,24 @@
 use std::{
-    fs::{create_dir_all, remove_file, symlink_metadata, File},
-    io::prelude::*,
     net::{IpAddr, ToSocketAddrs},
     time::{Duration, SystemTime},
 };
 
+use bytes::{buf::ext::BufExt, Bytes, BytesMut};
+use futures::stream::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::{blocking::Client, blocking::Response, header::HeaderMap, Url};
-use rocket::{http::ContentType, http::Cookie, response::Content, Route};
+use reqwest::{header::HeaderMap, Client, Response, Url};
+use rocket::{
+    http::ContentType,
+    http::Cookie,
+    response::{Content, Responder},
+    Route,
+};
 use soup::prelude::*;
+use tokio::{
+    fs::{create_dir_all, remove_file, symlink_metadata, File},
+    io::AsyncWriteExt,
+};
 
 use crate::{error::Error, util::Cached, CONFIG};
 
@@ -17,7 +26,7 @@ pub fn routes() -> Vec<Route> {
     routes![icon]
 }
 
-const FALLBACK_ICON: &[u8; 344] = include_bytes!("../static/fallback-icon.png");
+const FALLBACK_ICON: &'static [u8] = include_bytes!("../static/fallback-icon.png");
 
 const ALLOWED_CHARS: &str = "_-.";
 
@@ -52,7 +61,7 @@ fn is_valid_domain(domain: &str) -> bool {
 }
 
 #[get("/<domain>/icon.png")]
-fn icon(domain: String) -> Cached<Content<Vec<u8>>> {
+async fn icon<'a>(domain: String) -> Cached<Content<impl Responder<'a, 'static>>> {
     let icon_type = ContentType::new("image", "x-icon");
 
     if !is_valid_domain(&domain) {
@@ -60,7 +69,30 @@ fn icon(domain: String) -> Cached<Content<Vec<u8>>> {
         return Cached::long(Content(icon_type, FALLBACK_ICON.to_vec()));
     }
 
-    Cached::long(Content(icon_type, get_icon(&domain)))
+    let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
+
+    if let Some(icon) = get_cached_icon(&path).await {
+        return Cached::long(Content(icon_type, icon.to_vec()));
+    }
+
+    if CONFIG.disable_icon_download() {
+        return Cached::long(Content(icon_type, FALLBACK_ICON.to_vec()));
+    }
+
+    // Get the icon, or fallback in case of error
+    match download_icon(&domain).await {
+        Ok(icon) => {
+            save_icon(&path, &icon).await;
+            Cached::long(Content(icon_type, icon.to_vec()))
+        }
+        Err(e) => {
+            error!("Error downloading icon: {:?}", e);
+            let miss_indicator = path + ".miss";
+            let empty_icon = Vec::new();
+            save_icon(&miss_indicator, &empty_icon).await;
+            Cached::long(Content(icon_type, FALLBACK_ICON.to_vec()))
+        }
+    }
 }
 
 /// TODO: This is extracted from IpAddr::is_global, which is unstable:
@@ -190,49 +222,23 @@ fn check_icon_domain_is_blacklisted(domain: &str) -> bool {
     is_blacklisted
 }
 
-fn get_icon(domain: &str) -> Vec<u8> {
-    let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
-
-    if let Some(icon) = get_cached_icon(&path) {
-        return icon;
-    }
-
-    if CONFIG.disable_icon_download() {
-        return FALLBACK_ICON.to_vec();
-    }
-
-    // Get the icon, or fallback in case of error
-    match download_icon(&domain) {
-        Ok(icon) => {
-            save_icon(&path, &icon);
-            icon
-        }
-        Err(e) => {
-            error!("Error downloading icon: {:?}", e);
-            let miss_indicator = path + ".miss";
-            let empty_icon = Vec::new();
-            save_icon(&miss_indicator, &empty_icon);
-            FALLBACK_ICON.to_vec()
-        }
-    }
-}
-
-fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
+async fn get_cached_icon<'a>(path: &str) -> Option<Vec<u8>> {
     // Check for expiration of negatively cached copy
-    if icon_is_negcached(path) {
+    if icon_is_negcached(path).await {
         return Some(FALLBACK_ICON.to_vec());
     }
 
     // Check for expiration of successfully cached copy
-    if icon_is_expired(path) {
+    if icon_is_expired(path).await {
         return None;
     }
 
     // Try to read the cached icon, and return it if it exists
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = File::open(path).await {
         let mut buffer = Vec::new();
+        use tokio::io::AsyncReadExt;
 
-        if f.read_to_end(&mut buffer).is_ok() {
+        if f.read_to_end(&mut buffer).await.is_ok() {
             return Some(buffer);
         }
     }
@@ -240,22 +246,20 @@ fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
-    let meta = symlink_metadata(path)?;
+async fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
+    let meta = symlink_metadata(path).await?;
     let modified = meta.modified()?;
     let age = SystemTime::now().duration_since(modified)?;
 
     Ok(ttl > 0 && ttl <= age.as_secs())
 }
 
-fn icon_is_negcached(path: &str) -> bool {
+async fn icon_is_negcached(path: &str) -> bool {
     let miss_indicator = path.to_owned() + ".miss";
-    let expired = file_is_expired(&miss_indicator, CONFIG.icon_cache_negttl());
-
-    match expired {
+    match file_is_expired(&miss_indicator, CONFIG.icon_cache_negttl()).await {
         // No longer negatively cached, drop the marker
         Ok(true) => {
-            if let Err(e) = remove_file(&miss_indicator) {
+            if let Err(e) = remove_file(&miss_indicator).await {
                 error!("Could not remove negative cache indicator for icon {:?}: {:?}", path, e);
             }
             false
@@ -267,8 +271,8 @@ fn icon_is_negcached(path: &str) -> bool {
     }
 }
 
-fn icon_is_expired(path: &str) -> bool {
-    let expired = file_is_expired(path, CONFIG.icon_cache_ttl());
+async fn icon_is_expired(path: &str) -> bool {
+    let expired = file_is_expired(path, CONFIG.icon_cache_ttl()).await;
     expired.unwrap_or(true)
 }
 
@@ -296,7 +300,7 @@ impl Icon {
 /// let (mut iconlist, cookie_str) = get_icon_url("github.com")?;
 /// let (mut iconlist, cookie_str) = get_icon_url("gitlab.com")?;
 /// ```
-fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
+async fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     // Default URL with secure and insecure schemes
     let ssldomain = format!("https://{}", domain);
     let httpdomain = format!("http://{}", domain);
@@ -309,7 +313,10 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     // Some sites have extra security in place with for example XSRF Tokens.
     let mut cookie_str = String::new();
 
-    let resp = get_page(&ssldomain).or_else(|_| get_page(&httpdomain));
+    let resp = match get_page(&ssldomain).await {
+        r @ Ok(_) => r,
+        Err(_) => get_page(&httpdomain).await,
+    };
     if let Ok(content) = resp {
         // Extract the URL from the respose in case redirects occured (like @ gitlab.com)
         let url = content.url().clone();
@@ -332,9 +339,8 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
 
         // 512KB should be more than enough for the HTML, though as we only really need
         // the HTML header, it could potentially be reduced even further
-        let limited_reader = content.take(512 * 1024);
-
-        let soup = Soup::from_reader(limited_reader)?;
+        let bytes = stream_to_bytes_limit(content, 512 * 1024).await?;
+        let soup = Soup::from_reader(bytes.reader())?;
         // Search for and filter
         let favicons = soup
             .tag("link")
@@ -365,22 +371,23 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     Ok((iconlist, cookie_str))
 }
 
-fn get_page(url: &str) -> Result<Response, Error> {
-    get_page_with_cookies(url, "")
+async fn get_page(url: &str) -> Result<Response, Error> {
+    get_page_with_cookies(url, "").await
 }
 
-fn get_page_with_cookies(url: &str, cookie_str: &str) -> Result<Response, Error> {
+async fn get_page_with_cookies(url: &str, cookie_str: &str) -> Result<Response, Error> {
     if check_icon_domain_is_blacklisted(Url::parse(url).unwrap().host_str().unwrap_or_default()) {
         err!("Favicon rel linked to a non blacklisted domain!");
     }
 
     if cookie_str.is_empty() {
-        CLIENT.get(url).send()?.error_for_status().map_err(Into::into)
+        CLIENT.get(url).send().await?.error_for_status().map_err(Into::into)
     } else {
         CLIENT
             .get(url)
             .header("cookie", cookie_str)
-            .send()?
+            .send()
+            .await?
             .error_for_status()
             .map_err(Into::into)
     }
@@ -465,36 +472,35 @@ fn parse_sizes(sizes: Option<String>) -> (u16, u16) {
     (width, height)
 }
 
-fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
+async fn download_icon(domain: &str) -> Result<Bytes, Error> {
     if check_icon_domain_is_blacklisted(domain) {
         err!("Domain is blacklisted", domain)
     }
 
-    let (iconlist, cookie_str) = get_icon_url(&domain)?;
+    let (iconlist, cookie_str) = get_icon_url(&domain).await?;
 
-    let mut buffer = Vec::new();
-
-    use data_url::DataUrl;
+    let mut buf = Bytes::new();
 
     for icon in iconlist.iter().take(5) {
         if icon.href.starts_with("data:image") {
-            let datauri = DataUrl::process(&icon.href).unwrap();
+            let datauri = data_url::DataUrl::process(&icon.href).unwrap();
             // Check if we are able to decode the data uri
-            match datauri.decode_to_vec() {
-                Ok((body, _fragment)) => {
+            let mut temp = BytesMut::new();
+            match datauri.decode::<_, ()>(|bytes| Ok(temp.extend_from_slice(bytes))) {
+                Ok(_) => {
                     // Also check if the size is atleast 67 bytes, which seems to be the smallest png i could create
-                    if body.len() >= 67 {
-                        buffer = body;
+                    if temp.len() >= 67 {
+                        buf = temp.freeze();
                         break;
                     }
                 }
                 _ => warn!("data uri is invalid"),
             };
         } else {
-            match get_page_with_cookies(&icon.href, &cookie_str) {
-                Ok(mut res) => {
+            match get_page_with_cookies(&icon.href, &cookie_str).await {
+                Ok(res) => {
                     info!("Downloaded icon from {}", icon.href);
-                    res.copy_to(&mut buffer)?;
+                    buf = stream_to_bytes_limit(res, 512 * 1024).await?; // 512 KB for each icon max
                     break;
                 }
                 Err(_) => info!("Download failed for {}", icon.href),
@@ -502,25 +508,36 @@ fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
         }
     }
 
-    if buffer.is_empty() {
+    if buf.is_empty() {
         err!("Empty response")
     }
 
-    Ok(buffer)
+    Ok(buf)
 }
 
-fn save_icon(path: &str, icon: &[u8]) {
-    match File::create(path) {
+async fn save_icon(path: &str, icon: &[u8]) {
+    match File::create(path).await {
         Ok(mut f) => {
-            f.write_all(icon).expect("Error writing icon file");
+            f.write_all(icon).await.expect("Error writing icon file");
         }
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache");
+            create_dir_all(&CONFIG.icon_cache_folder())
+                .await
+                .expect("Error creating icon cache");
         }
         Err(e) => {
             info!("Icon save error: {:?}", e);
         }
     }
+}
+
+async fn stream_to_bytes_limit(res: Response, max_size: usize) -> Result<Bytes, reqwest::Error> {
+    let mut stream = res.bytes_stream().take(max_size);
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend(chunk?);
+    }
+    Ok(buf.freeze())
 }
 
 fn _header_map() -> HeaderMap {

@@ -36,6 +36,9 @@ macro_rules! make_config {
         pub struct Config { inner: RwLock<Inner> }
 
         struct Inner {
+            rocket_shutdown_handle: Option<rocket::Shutdown>,
+            ws_shutdown_handle: Option<ws::Sender>,
+
             templates: Handlebars<'static>,
             config: ConfigItems,
 
@@ -523,7 +526,14 @@ impl Config {
         validate_config(&config)?;
 
         Ok(Config {
-            inner: RwLock::new(Inner { templates: load_templates(&config.templates_folder), config, _env, _usr }),
+            inner: RwLock::new(Inner {
+                rocket_shutdown_handle: None,
+                ws_shutdown_handle: None,
+                templates: load_templates(&config.templates_folder),
+                config,
+                _env,
+                _usr,
+            }),
         })
     }
 
@@ -629,13 +639,10 @@ impl Config {
     }
 
     pub fn private_rsa_key(&self) -> String {
-        format!("{}.der", CONFIG.rsa_key_filename())
-    }
-    pub fn private_rsa_key_pem(&self) -> String {
         format!("{}.pem", CONFIG.rsa_key_filename())
     }
     pub fn public_rsa_key(&self) -> String {
-        format!("{}.pub.der", CONFIG.rsa_key_filename())
+        format!("{}.pub.pem", CONFIG.rsa_key_filename())
     }
     pub fn mail_enabled(&self) -> bool {
         let inner = &self.inner.read().unwrap().config;
@@ -677,6 +684,27 @@ impl Config {
         } else {
             let hb = &CONFIG.inner.read().unwrap().templates;
             hb.render(name, data).map_err(Into::into)
+        }
+    }
+
+    pub fn set_rocket_shutdown_handle(&self, handle: rocket::Shutdown) {
+        self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
+    }
+
+    pub fn set_ws_shutdown_handle(&self, handle: ws::Sender) {
+        self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
+    }
+
+    pub fn shutdown(&self) {
+        match self.inner.read() {
+            Ok(c) => {
+                warn!("Initiating shutdown!");
+                c.ws_shutdown_handle.clone().map(|s| s.shutdown());
+                // Wait a bit before stopping the web server
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                c.rocket_shutdown_handle.clone().map(|s| s.shutdown());
+            }
+            Err(_) => {}
         }
     }
 }
